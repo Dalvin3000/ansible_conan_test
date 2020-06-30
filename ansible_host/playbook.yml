@@ -1,0 +1,191 @@
+---
+- name: Update soft on Windows
+  hosts: atest_win
+  strategy: free
+  # when: ansible_facts['os_family'] == 'Windows'
+  vars:
+    app_name: ansible_test
+    app_author: maintainer
+    app_channel: win_stable
+  ignore_unreachable: yes
+  gather_facts: no
+  tasks:
+    # Check Conan package manager and our local repo
+    - name: Install Conan....
+      block:
+      - name: Check Conan....
+        vars:
+          required_pips:
+            - conan
+        win_command: python -m pip install conan # "{{ item }}"
+        register: r
+        changed_when: '"Requirement already satisfied: conan" not in r.stdout'
+        # with_items: "{{ required_pips | difference(win_pip_result.stdout_lines) }}"
+      - win_command: conan remote remove conan-center
+        register: r
+        changed_when: 'r.stderr == ""'
+        failed_when: false
+      - name: Check local distrib repo
+        win_command: conan remote add local http://192.168.160.164:9300
+        register: r
+        changed_when: '"already exists in remotes" not in r.stderr'
+        failed_when: "r.stderr != \"\" and \"Remote 'local' already exists in remotes\" not in r.stderr"
+
+    # Check PsExec
+    - name: Check PsExec tool
+      win_chocolatey:
+        name: psexec
+        ignore_checksums: yes
+        state: present
+
+    # Install or update software
+    - name: Install/Update application
+      win_shell: conan install -u {{ app_name }}/[0.x]@{{ app_author }}/{{ app_channel }}
+      register: install
+      changed_when: '"Package installed" in install.stdout'
+      failed_when: '"ERROR" in install.stderr and "Unable to find a working compiler" not in install.stderr'
+    - set_fact:
+        installed_version: "{{ install.stdout | regex_search(app_name + '/([0-9.]+[^@]*)@.* from ', '\\1', multiline=True, ignorecase=True) }}"
+    - debug: var=installed_version
+
+    # Safe-deploy software
+    - name: Safe-deploy software
+      when: install.changed
+      block:
+      - name: Stop auld application
+        win_shell: 'stop-process -name {{ app_name }} -force -passthru'
+        register: r
+        failed_when: false
+        changed_when: "app_name in r.stdout"
+      - name: Remove old deployed application
+        win_file:
+          path: "{{ app_name }}-deploy"
+          state: absent
+      - name: Move installed package to deploy location
+        win_shell: "copy-item {{ app_name }} -destination {{ app_name }}-deploy -recurse -force"
+
+    # Restart app
+    - name: Check application running
+      win_shell: ps
+      register: r
+      changed_when: app_name not in r.stdout
+
+    - name: Restart software
+      when: r.changed
+      block:
+      - name: Run application
+        win_psexec:
+          command: 'c:\users\dev\{{ app_name }}-deploy\bin\{{ app_name }}'
+          hostnames: localhost
+          interactive: yes
+          # session: 1
+          username: dev
+          password: dev
+          system: yes
+          # nobanner: yes
+          wait: no
+        register: r
+        failed_when: '"PsExec could not start" in r.stderr'
+      - name: Wait just a second...
+        win_shell: sleep 3
+        failed_when: false
+      - name: Check application running
+        win_shell: ps
+        register: r
+        failed_when: app_name not in r.stdout
+
+- name: Update soft on Linux
+  hosts: atest_nix
+  strategy: free
+  # when: ansible_facts['system'] == 'Linux'
+  vars:
+    app_name: ansible_test
+    app_author: maintainer
+    app_channel: nix_stable
+  ignore_unreachable: yes
+  gather_facts: no
+  tasks:
+    # Check needed packages installed on linux
+    - name: Install prereqs
+      block:
+      - name: Checking pyton, x11, ogl...
+        become: yes
+        apt:
+          pkg:
+          - python3
+          - virtualenv
+          - libglu1-mesa
+          - libxkbcommon-x11-0
+          - x11-apps
+          state: present
+
+    # Check Conan package manager and our local repo
+    - name: Check Conan....
+      become: yes
+      pip:
+        name: conan
+        state: latest
+        virtualenv: /usr/local
+    - shell: conan remote remove conan-center || true
+      changed_when: false
+    - name: Check local distrib repo
+      shell: conan remote add local http://192.168.160.164:9300 || true
+      register: r
+      changed_when: '"already exists in remotes" not in r.stderr'
+
+    # Install or update software
+    - name: Install/Update application
+      shell: conan install -u {{ app_name }}/[0.x]@{{ app_author }}/{{ app_channel }}
+      register: install
+      changed_when: '"Package installed" in install.stdout'
+      failed_when: '"ERROR" in install.stderr and "Unable to find a working compiler" not in install.stderr'
+    - set_fact:
+        installed_version: "{{ install.stdout | regex_search(app_name + '/([0-9.]+[^@]*)@.* from ', '\\1', multiline=True, ignorecase=True) }}"
+    - debug: var=installed_version
+
+    # Safe-deploy software
+    - name: Safe-deploy software
+      when: install.changed
+      block:
+      - name: Stop auld application
+        shell: pkill -9 {{ app_name }} -e || true
+        register: r
+        failed_when: false
+        changed_when: '"killed" in r.stdout'
+      - name: Remove old deployed application
+        file:
+          path: "{{ app_name }}-deploy"
+          state: absent
+      - name: Move installed package to deploy location
+        shell: "cp -r {{ app_name }} {{ app_name }}-deploy"
+      - name: Modifying access
+        file:
+          path: "{{ app_name }}-deploy/bin/{{ app_name }}"
+          mode: u+x
+
+    # Restart app
+    - name: Check application running
+      shell: ps x
+      register: r
+      changed_when: '"./" + app_name not in r.stdout'
+
+    - name: Restart software
+      when: r.changed
+      block:
+      - file:
+          path: ~/run_error.log
+          state: absent
+      - name: Run application
+        shell: |
+          export DISPLAY=localhost:10.0
+          nohup ./{{ app_name }} </dev/null >/dev/null 2>~/run_error.log &
+          sleep 3
+          cat ~/run_error.log 1>&2
+        args:
+          chdir: "{{ app_name }}-deploy/bin"
+        register: r
+        failed_when: '"failed to start" in r.stderr or "failed to run command" in r.stderr'
+      - name: Check application running
+        shell: ps x
+        register: r
+        failed_when: '"./" + app_name not in r.stdout'

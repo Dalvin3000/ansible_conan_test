@@ -1,0 +1,4 @@
+[submodule "soft/cmake"]
+	path = soft/cmake
+	url = git@gitlab.pay-trans.ru:CPP/tools/cmake.git
+	branch = develop
